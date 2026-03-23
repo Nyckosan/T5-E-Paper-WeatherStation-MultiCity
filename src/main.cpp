@@ -2,6 +2,8 @@
 
 #include <WiFi.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
+#include <driver/gpio.h>
 #include <time.h>
 
 #include "app_config.h"
@@ -169,27 +171,70 @@ uint32_t computeSleepSeconds()
     }
 
     const uint32_t interval = AppConfig::kUpdateIntervalSeconds;
-    uint32_t sleepFor = interval - (static_cast<uint32_t>(now) % interval);
-
-    if (sleepFor < 15) {
-        sleepFor += interval;
+    if (interval == 0) {
+        return 3600;
     }
 
-    return sleepFor;
+    const uint32_t secondsPastInterval = static_cast<uint32_t>(now) % interval;
+    if (secondsPastInterval == 0) {
+        return interval;
+    }
+
+    return interval - secondsPastInterval;
 }
 
 void enterDeepSleep()
 {
     const uint32_t sleepSeconds = computeSleepSeconds();
+    const uint64_t sleepMicros = static_cast<uint64_t>(sleepSeconds) * 1000000ULL;
+    esp_sleep_enable_timer_wakeup(sleepMicros);
 
-    esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(sleepSeconds) * 1000000ULL);
+    bool useLightSleepFallback = false;
 
     if (AppConfig::kEnableTouchWakeup) {
+        const gpio_num_t touchPin = static_cast<gpio_num_t>(TouchPins::kTouchInt);
         const uint64_t touchMask = 1ULL << TouchPins::kTouchInt;
-        esp_sleep_enable_ext1_wakeup(touchMask, ESP_EXT1_WAKEUP_ANY_HIGH);
+
+        pinMode(TouchPins::kTouchInt, INPUT_PULLUP);
+        const bool wakeOnHigh = digitalRead(TouchPins::kTouchInt) == LOW;
+
+        bool configuredDeepSleepTouchWake = false;
+#if SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
+        if (esp_sleep_is_valid_wakeup_gpio(touchPin)) {
+            const esp_deepsleep_gpio_wake_up_mode_t deepSleepMode =
+                wakeOnHigh ? ESP_GPIO_WAKEUP_GPIO_HIGH : ESP_GPIO_WAKEUP_GPIO_LOW;
+            const esp_err_t deepSleepErr = esp_deep_sleep_enable_gpio_wakeup(touchMask, deepSleepMode);
+            configuredDeepSleepTouchWake = (deepSleepErr == ESP_OK);
+            if (!configuredDeepSleepTouchWake) {
+                Serial.printf("[sleep] deep-sleep touch wake setup failed: %d\r\n", static_cast<int>(deepSleepErr));
+            }
+        }
+#endif
+
+        if (!configuredDeepSleepTouchWake) {
+            const gpio_int_type_t lightSleepMode =
+                wakeOnHigh ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
+            esp_err_t gpioWakeErr = gpio_wakeup_enable(touchPin, lightSleepMode);
+            if (gpioWakeErr == ESP_OK) {
+                gpioWakeErr = esp_sleep_enable_gpio_wakeup();
+            }
+
+            if (gpioWakeErr == ESP_OK) {
+                useLightSleepFallback = true;
+                Serial.printf("[sleep] using light-sleep touch wake on GPIO %d\r\n", TouchPins::kTouchInt);
+            } else {
+                Serial.printf("[sleep] touch wake setup failed: %d\r\n", static_cast<int>(gpioWakeErr));
+            }
+        }
     }
 
     epd_poweroff_all();
+
+    if (useLightSleepFallback) {
+        esp_light_sleep_start();
+        esp_restart();
+    }
+
     esp_deep_sleep_start();
 }
 
@@ -338,5 +383,3 @@ void loop()
 {
     delay(1000);
 }
-
-

@@ -22,8 +22,8 @@ static constexpr uint32_t kTouchDebounceMs = 350;
 static constexpr uint32_t kStaleAfterSeconds = 5400;
 static constexpr uint8_t kFullRefreshEveryNCycles = 6;
 
-// Touch wakeup can be unstable across board revisions, so default is timer wake only.
-static constexpr bool kEnableTouchWakeup = false;
+// Allow touch to wake the board between hourly timer refreshes.
+static constexpr bool kEnableTouchWakeup = true;
 
 static constexpr const char *kUnits = "metric";
 static constexpr const char *kTimeFormat = "%H:%M";
@@ -32,4 +32,3 @@ static constexpr const char *kNtpServer1 = "pool.ntp.org";
 static constexpr const char *kNtpServer2 = "time.nist.gov";
 
 } // namespace AppConfig
-
