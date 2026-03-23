@@ -2,6 +2,8 @@
 
 Firmware for the LilyGO T5 4.7 S3 e-paper board using PlatformIO + Arduino.
 
+![T5 Weather Station](T5.jpg)
+
 ## Features
 - Multi-city weather dashboard (up to 5 configured cities)
 - Touch navigation (`< Prev`, `Next >`) between cities
