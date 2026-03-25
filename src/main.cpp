@@ -23,6 +23,91 @@ namespace {
 
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
 constexpr uint32_t NTP_WAIT_TIMEOUT_MS = 12000;
+constexpr uint32_t DEFAULT_UPDATE_INTERVAL_SECONDS = 3600;
+
+const char *resetReasonLabel(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_UNKNOWN:
+            return "unknown";
+        case ESP_RST_POWERON:
+            return "poweron";
+        case ESP_RST_EXT:
+            return "external";
+        case ESP_RST_SW:
+            return "software";
+        case ESP_RST_PANIC:
+            return "panic";
+        case ESP_RST_INT_WDT:
+            return "int_wdt";
+        case ESP_RST_TASK_WDT:
+            return "task_wdt";
+        case ESP_RST_WDT:
+            return "other_wdt";
+        case ESP_RST_DEEPSLEEP:
+            return "deepsleep";
+        case ESP_RST_BROWNOUT:
+            return "brownout";
+        case ESP_RST_SDIO:
+            return "sdio";
+#if defined(ESP_RST_USB)
+        case ESP_RST_USB:
+            return "usb";
+#endif
+#if defined(ESP_RST_JTAG)
+        case ESP_RST_JTAG:
+            return "jtag";
+#endif
+        default:
+            return "unmapped";
+    }
+}
+
+const char *wakeupCauseLabel(esp_sleep_wakeup_cause_t cause)
+{
+    switch (cause) {
+        case ESP_SLEEP_WAKEUP_UNDEFINED:
+            return "undefined";
+        case ESP_SLEEP_WAKEUP_ALL:
+            return "all";
+        case ESP_SLEEP_WAKEUP_EXT0:
+            return "ext0";
+        case ESP_SLEEP_WAKEUP_EXT1:
+            return "ext1";
+        case ESP_SLEEP_WAKEUP_TIMER:
+            return "timer";
+        case ESP_SLEEP_WAKEUP_TOUCHPAD:
+            return "touchpad";
+        case ESP_SLEEP_WAKEUP_ULP:
+            return "ulp";
+        case ESP_SLEEP_WAKEUP_GPIO:
+            return "gpio";
+        case ESP_SLEEP_WAKEUP_UART:
+            return "uart";
+        case ESP_SLEEP_WAKEUP_WIFI:
+            return "wifi";
+        case ESP_SLEEP_WAKEUP_COCPU:
+            return "cocpu";
+        case ESP_SLEEP_WAKEUP_COCPU_TRAP_TRIG:
+            return "cocpu_trap";
+        case ESP_SLEEP_WAKEUP_BT:
+            return "bt";
+        default:
+            return "unmapped";
+    }
+}
+
+void logBootDiagnostics()
+{
+    const esp_reset_reason_t resetReason = esp_reset_reason();
+    const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+
+    Serial.printf("[boot] reset=%d (%s) wake=%d (%s)\r\n",
+                  static_cast<int>(resetReason),
+                  resetReasonLabel(resetReason),
+                  static_cast<int>(wakeCause),
+                  wakeupCauseLabel(wakeCause));
+}
 
 String maskedKeyInfo()
 {
@@ -165,14 +250,13 @@ bool refreshCity(uint8_t cityIndex)
 
 uint32_t computeSleepSeconds()
 {
+    const uint32_t interval =
+        (AppConfig::kUpdateIntervalSeconds == 0) ? DEFAULT_UPDATE_INTERVAL_SECONDS
+                                                  : AppConfig::kUpdateIntervalSeconds;
+
     const time_t now = time(nullptr);
     if (now <= 0) {
-        return AppConfig::kUpdateIntervalSeconds;
-    }
-
-    const uint32_t interval = AppConfig::kUpdateIntervalSeconds;
-    if (interval == 0) {
-        return 3600;
+        return interval;
     }
 
     const uint32_t secondsPastInterval = static_cast<uint32_t>(now) % interval;
@@ -183,13 +267,22 @@ uint32_t computeSleepSeconds()
     return interval - secondsPastInterval;
 }
 
+time_t currentRefreshBoundary(time_t now, uint32_t intervalSeconds)
+{
+    if (now <= 0 || intervalSeconds == 0) {
+        return 0;
+    }
+
+    return now - (now % static_cast<time_t>(intervalSeconds));
+}
+
 void enterDeepSleep()
 {
     const uint32_t sleepSeconds = computeSleepSeconds();
     const uint64_t sleepMicros = static_cast<uint64_t>(sleepSeconds) * 1000000ULL;
     esp_sleep_enable_timer_wakeup(sleepMicros);
 
-    bool useLightSleepFallback = false;
+    Serial.printf("[sleep] timer wake in %lu seconds\r\n", static_cast<unsigned long>(sleepSeconds));
 
     if (AppConfig::kEnableTouchWakeup) {
         const gpio_num_t touchPin = static_cast<gpio_num_t>(TouchPins::kTouchInt);
@@ -212,28 +305,13 @@ void enterDeepSleep()
 #endif
 
         if (!configuredDeepSleepTouchWake) {
-            const gpio_int_type_t lightSleepMode =
-                wakeOnHigh ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
-            esp_err_t gpioWakeErr = gpio_wakeup_enable(touchPin, lightSleepMode);
-            if (gpioWakeErr == ESP_OK) {
-                gpioWakeErr = esp_sleep_enable_gpio_wakeup();
-            }
-
-            if (gpioWakeErr == ESP_OK) {
-                useLightSleepFallback = true;
-                Serial.printf("[sleep] using light-sleep touch wake on GPIO %d\r\n", TouchPins::kTouchInt);
-            } else {
-                Serial.printf("[sleep] touch wake setup failed: %d\r\n", static_cast<int>(gpioWakeErr));
-            }
+            // Avoid light-sleep fallback restart loops on boards where this GPIO
+            // cannot be used as a deep-sleep wake source.
+            Serial.printf("[sleep] touch wake unavailable on GPIO %d; timer wake only\r\n", TouchPins::kTouchInt);
         }
     }
 
     epd_poweroff_all();
-
-    if (useLightSleepFallback) {
-        esp_light_sleep_start();
-        esp_restart();
-    }
 
     esp_deep_sleep_start();
 }
@@ -260,6 +338,7 @@ void setup()
 {
     Serial.begin(115200);
     delay(100);
+    logBootDiagnostics();
     Serial.println("[cfg] OWM key " + maskedKeyInfo());
 
     if (!gDisplay.begin()) {
@@ -345,8 +424,49 @@ void setup()
     gStateStore.saveRefreshCounter(refreshCounter + 1);
     gStateStore.saveActiveCityIndex(activeCityIndex);
 
+    const uint32_t refreshIntervalSec =
+        (AppConfig::kUpdateIntervalSeconds == 0) ? DEFAULT_UPDATE_INTERVAL_SECONDS
+                                                 : AppConfig::kUpdateIntervalSeconds;
+    time_t lastRefreshBoundary = currentRefreshBoundary(time(nullptr), refreshIntervalSec);
+
     uint32_t interactionStart = millis();
     while ((millis() - interactionStart) < AppConfig::kInteractionWindowMs) {
+        const time_t now = time(nullptr);
+        const time_t boundary = currentRefreshBoundary(now, refreshIntervalSec);
+        if (boundary > 0 && boundary > lastRefreshBoundary) {
+            lastRefreshBoundary = boundary;
+            Serial.println("[refresh] on-hour boundary reached during interaction window");
+
+            const bool canUseWifiNow = wifiConnected && (WiFi.status() == WL_CONNECTED);
+            if (canUseWifiNow) {
+                refreshCity(activeCityIndex);
+
+                if (gCityCount > 1) {
+                    uint8_t extraCity = roundRobinIndex;
+                    if (extraCity == activeCityIndex) {
+                        extraCity = clampIndex(static_cast<uint8_t>(extraCity + 1));
+                    }
+
+                    refreshCity(extraCity);
+                    roundRobinIndex = clampIndex(static_cast<uint8_t>(extraCity + 1));
+                    gStateStore.saveRoundRobinIndex(roundRobinIndex);
+                }
+            } else if (activeCityIndex < gCityCount) {
+                gCities[activeCityIndex].lastError = "Wi-Fi unavailable at hourly refresh";
+                gCities[activeCityIndex].snapshot.stale = true;
+            }
+
+            refreshStaleFlags();
+            renderActiveCity(activeCityIndex, true);
+
+            ++refreshCounter;
+            gStateStore.saveRefreshCounter(refreshCounter);
+            gStateStore.saveActiveCityIndex(activeCityIndex);
+
+            interactionStart = millis();
+            continue;
+        }
+
         const TouchAction action = gTouch.pollTouchAction(AppConfig::kTouchDebounceMs);
         if (action == TouchAction::None) {
             delay(20);
@@ -376,6 +496,90 @@ void setup()
     }
 
     disconnectWifi();
+
+    if (!AppConfig::kEnableTouchWakeup && AppConfig::kStayAwakeWhenTouchWakeDisabled) {
+        Serial.println("[run] touch wake disabled; staying awake for interactive mode");
+
+        const uint32_t refreshIntervalSec =
+            (AppConfig::kUpdateIntervalSeconds == 0) ? DEFAULT_UPDATE_INTERVAL_SECONDS
+                                                     : AppConfig::kUpdateIntervalSeconds;
+        const uint32_t refreshIntervalMs = refreshIntervalSec * 1000UL;
+        uint32_t lastRefreshMs = millis();
+        time_t lastRefreshBoundaryAwake = currentRefreshBoundary(time(nullptr), refreshIntervalSec);
+
+        while (true) {
+            const TouchAction action = gTouch.pollTouchAction(AppConfig::kTouchDebounceMs);
+            if (action != TouchAction::None) {
+                if (action == TouchAction::PrevCity) {
+                    activeCityIndex = (activeCityIndex == 0) ? static_cast<uint8_t>(gCityCount - 1)
+                                                             : static_cast<uint8_t>(activeCityIndex - 1);
+                } else if (action == TouchAction::NextCity) {
+                    activeCityIndex = clampIndex(static_cast<uint8_t>(activeCityIndex + 1));
+                }
+
+                gStateStore.saveActiveCityIndex(activeCityIndex);
+                refreshStaleFlags();
+                renderActiveCity(activeCityIndex, true);
+            }
+
+            bool periodicRefreshDue = false;
+            const time_t now = time(nullptr);
+            const time_t boundary = currentRefreshBoundary(now, refreshIntervalSec);
+            if (boundary > 0) {
+                periodicRefreshDue = boundary > lastRefreshBoundaryAwake;
+                if (periodicRefreshDue) {
+                    lastRefreshBoundaryAwake = boundary;
+                    Serial.printf("[refresh] on-hour boundary reached: %lld\r\n", static_cast<long long>(boundary));
+                }
+            } else if ((millis() - lastRefreshMs) >= refreshIntervalMs) {
+                periodicRefreshDue = true;
+                lastRefreshMs = millis();
+            }
+
+            if (periodicRefreshDue) {
+                gDisplay.renderStatusMessage("Network", "Refreshing weather", true);
+
+                const bool periodicWifiConnected = connectWifi();
+                if (periodicWifiConnected) {
+                    syncTime();
+                    refreshCity(activeCityIndex);
+
+                    if (gCityCount > 1) {
+                        uint8_t extraCity = roundRobinIndex;
+                        if (extraCity == activeCityIndex) {
+                            extraCity = clampIndex(static_cast<uint8_t>(extraCity + 1));
+                        }
+
+                        refreshCity(extraCity);
+                        roundRobinIndex = clampIndex(static_cast<uint8_t>(extraCity + 1));
+                        gStateStore.saveRoundRobinIndex(roundRobinIndex);
+                    }
+                } else if (activeCityIndex < gCityCount) {
+                    gCities[activeCityIndex].lastError = "Wi-Fi connection failed";
+                    gCities[activeCityIndex].snapshot.stale = true;
+                }
+
+                disconnectWifi();
+                refreshStaleFlags();
+                renderActiveCity(activeCityIndex, true);
+
+                ++refreshCounter;
+                gStateStore.saveRefreshCounter(refreshCounter);
+                gStateStore.saveActiveCityIndex(activeCityIndex);
+                lastRefreshMs = millis();
+
+                const time_t nowAfterRefresh = time(nullptr);
+                const time_t boundaryAfterRefresh =
+                    currentRefreshBoundary(nowAfterRefresh, refreshIntervalSec);
+                if (boundaryAfterRefresh > 0) {
+                    lastRefreshBoundaryAwake = boundaryAfterRefresh;
+                }
+            }
+
+            delay(20);
+        }
+    }
+
     enterDeepSleep();
 }
 
