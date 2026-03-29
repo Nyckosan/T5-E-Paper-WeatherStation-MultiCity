@@ -36,17 +36,6 @@ Firmware for the LilyGO T5 4.7 S3 e-paper board using PlatformIO + Arduino.
 5. Optional serial monitor:
    - `pio device monitor --baud 115200`
 
-## Security Notes
-- `include/secrets.h` is intentionally excluded from git via `.gitignore`.
-- Never commit real WiFi passwords or API keys.
-- Keep `include/secrets.example.h` as placeholders only.
-
-## Publishing Checklist
-1. Confirm `include/secrets.h` is placeholder-only or local-only.
-2. Run a secret scan before pushing (example):
-   - `Get-ChildItem -Recurse -File | Select-String -Pattern 'WIFI_SSID|WIFI_PASSWORD|OWM_API_KEY|apikey|api_key|password'`
-3. Commit and push to your remote repository.
-
 ## Notes
 - Units default to metric and time format uses 24-hour clock.
 - Touch wake from deep sleep is disabled by default (`kEnableTouchWakeup = false`) due board variance.
